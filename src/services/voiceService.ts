@@ -8,144 +8,189 @@ export interface VoiceState {
   language: VoiceLanguage;
 }
 
-// BCP-47 Language tags and names
+// BCP-47 Language config
 export const LANG_CONFIG: Record<VoiceLanguage, { name: string; nativeName: string; speechCode: string; flag: string }> = {
-  en: {
-    name: 'English',
-    nativeName: 'English',
-    speechCode: 'en-US',
-    flag: '🇬🇧',
-  },
-  ta: {
-    name: 'Tamil',
-    nativeName: 'தமிழ்',
-    speechCode: 'ta-IN',
-    flag: '🇮🇳',
-  },
-  hi: {
-    name: 'Hindi',
-    nativeName: 'हिन्दी',
-    speechCode: 'hi-IN',
-    flag: '🇮🇳',
-  },
+  en: { name: 'English',  nativeName: 'English',  speechCode: 'en-US', flag: '🇬🇧' },
+  ta: { name: 'Tamil',    nativeName: 'தமிழ்',    speechCode: 'ta-IN', flag: '🇮🇳' },
+  hi: { name: 'Hindi',    nativeName: 'हिन्दी',    speechCode: 'hi-IN', flag: '🇮🇳' },
 };
 
-// Check if SpeechSynthesis is supported
-export const isSpeechSynthesisSupported = (): boolean => {
-  return typeof window !== 'undefined' && 'speechSynthesis' in window;
-};
+export const isSpeechSynthesisSupported = (): boolean =>
+  typeof window !== 'undefined' && 'speechSynthesis' in window;
 
-// Check if SpeechRecognition is supported
-export const isSpeechRecognitionSupported = (): boolean => {
-  return typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
-};
+export const isSpeechRecognitionSupported = (): boolean =>
+  typeof window !== 'undefined' &&
+  ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
 
-/**
- * Play an audible chime tone using Web Audio API (works reliably across all browsers and OS)
- */
+// ─── Web Audio chime (works regardless of TTS availability) ─────────────────
 export const playNotificationChime = (): void => {
   try {
     if (typeof window === 'undefined') return;
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioContextClass) return;
-
-    const ctx = new AudioContextClass();
-    if (ctx.state === 'suspended') {
-      ctx.resume();
-    }
-
-    const now = ctx.currentTime;
-
-    // Dual-tone high-fidelity chime (587.33 Hz D5 -> 880 Hz A5)
-    const osc1 = ctx.createOscillator();
-    const gain1 = ctx.createGain();
-    osc1.type = 'sine';
-    osc1.frequency.setValueAtTime(587.33, now);
-    gain1.gain.setValueAtTime(0.2, now);
-    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-    osc1.connect(gain1);
-    gain1.connect(ctx.destination);
-    osc1.start(now);
-    osc1.stop(now + 0.22);
-
-    const osc2 = ctx.createOscillator();
-    const gain2 = ctx.createGain();
-    osc2.type = 'sine';
-    osc2.frequency.setValueAtTime(880, now + 0.1);
-    gain2.gain.setValueAtTime(0.25, now + 0.1);
-    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
-    osc2.connect(gain2);
-    gain2.connect(ctx.destination);
-    osc2.start(now + 0.1);
-    osc2.stop(now + 0.4);
+    const AC = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    // Resume AudioContext in case it was suspended by browser autoplay policy
+    ctx.resume().then(() => {
+      const now = ctx.currentTime;
+      const schedule = (freq: number, start: number, dur: number, vol: number) => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now + start);
+        gain.gain.setValueAtTime(vol, now + start);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + start + dur);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + start);
+        osc.stop(now + start + dur);
+      };
+      schedule(587.33, 0,    0.22, 0.22);
+      schedule(880,    0.12, 0.30, 0.25);
+    }).catch(() => {/* ignore */});
   } catch (e) {
-    console.warn('Web Audio chime could not play:', e);
+    console.warn('Chime error:', e);
   }
 };
 
+// ─── Robust voice loader ─────────────────────────────────────────────────────
+/**
+ * Returns voices, waiting up to 2 s for them to load if not yet ready.
+ */
+function loadVoices(): Promise<SpeechSynthesisVoice[]> {
+  return new Promise((resolve) => {
+    if (!('speechSynthesis' in window)) { resolve([]); return; }
+    const synth = window.speechSynthesis;
+
+    const voices = synth.getVoices();
+    if (voices.length > 0) { resolve(voices); return; }
+
+    let resolved = false;
+    const onChanged = () => {
+      if (resolved) return;
+      resolved = true;
+      resolve(synth.getVoices());
+    };
+
+    synth.addEventListener('voiceschanged', onChanged);
+    // Fallback: resolve after 2 s even if event never fires
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        synth.removeEventListener('voiceschanged', onChanged);
+        resolve(synth.getVoices());
+      }
+    }, 2000);
+  });
+}
+
+// ─── Find the best matching voice for a language ────────────────────────────
+function pickVoice(voices: SpeechSynthesisVoice[], lang: VoiceLanguage): SpeechSynthesisVoice | null {
+  if (voices.length === 0) return null;
+
+  const langCode = LANG_CONFIG[lang].speechCode.toLowerCase(); // e.g. "hi-in"
+  const langPrefix = langCode.split('-')[0];                   // e.g. "hi"
+
+  if (lang === 'hi') {
+    return (
+      voices.find(v => v.lang.toLowerCase() === 'hi-in') ||
+      voices.find(v => v.lang.toLowerCase().startsWith('hi')) ||
+      voices.find(v => v.name.toLowerCase().includes('hindi')) ||
+      voices.find(v => v.name.toLowerCase().includes('hemant')) ||
+      voices.find(v => v.name.toLowerCase().includes('kalpana')) ||
+      voices.find(v => v.name.toLowerCase().includes('swara')) ||
+      voices.find(v => v.name.toLowerCase().includes('madhur')) ||
+      // Google TTS voices on Android/ChromeOS
+      voices.find(v => v.name.toLowerCase().includes('google हिन्दी')) ||
+      null
+    );
+  }
+
+  if (lang === 'ta') {
+    return (
+      voices.find(v => v.lang.toLowerCase() === 'ta-in') ||
+      voices.find(v => v.lang.toLowerCase().startsWith('ta')) ||
+      voices.find(v => v.name.toLowerCase().includes('tamil')) ||
+      voices.find(v => v.name.toLowerCase().includes('valluvar')) ||
+      null
+    );
+  }
+
+  // English — prefer natural/Google voices
+  return (
+    voices.find(v => v.lang.toLowerCase().startsWith('en') &&
+      (v.name.includes('Natural') || v.name.includes('Google') ||
+       v.name.includes('Jenny') || v.name.includes('David') ||
+       v.name.includes('Mark') || v.name.includes('Zira'))) ||
+    voices.find(v => v.lang.toLowerCase().startsWith('en')) ||
+    voices.find(v => v.default) ||
+    voices[0]
+  );
+}
+
+// ─── Clean text for TTS ──────────────────────────────────────────────────────
+function prepareText(text: string, lang: VoiceLanguage): string {
+  let clean = text
+    .replace(/[*_#`~>\[\]\(\)]/g, ' ')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/•/g, ',')
+    .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')   // strip emojis
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Split on sentence endings including Hindi danda ।
+  const sentenceEnd = /[.!?।]+/g;
+  const sentences = clean.split(sentenceEnd).map(s => s.trim()).filter(Boolean);
+
+  if (sentences.length === 0) return clean.slice(0, 300);
+
+  // Hindi: allow 3 sentences (shorter sentences); others: 2
+  const maxSentences = lang === 'hi' ? 3 : 2;
+  const limited = sentences.slice(0, maxSentences).join('. ');
+
+  return limited.length > 350 ? limited.slice(0, 345) + '.' : limited;
+}
+
+// ─── VoiceController class ───────────────────────────────────────────────────
 class VoiceController {
   private synth: SpeechSynthesis | null = null;
   private currentUtterance: SpeechSynthesisUtterance | null = null;
   private recognition: any = null;
   private listeners: ((state: { isPlaying: boolean; isPaused: boolean; isListening: boolean }) => void)[] = [];
+  // Keep utterances alive so Chrome GC doesn't silence them mid-speech
+  private utterancePool: SpeechSynthesisUtterance[] = [];
 
   constructor() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       this.synth = window.speechSynthesis;
-      if (this.synth) {
-        this.synth.onvoiceschanged = () => {
-          // pre-load voices
-          this.getAvailableVoices();
-        };
-      }
+      // Pre-warm voice list
+      loadVoices().then(() => {/* voices loaded */});
     }
   }
 
-  public subscribe(callback: (state: { isPlaying: boolean; isPaused: boolean; isListening: boolean }) => void) {
-    this.listeners.push(callback);
-    return () => {
-      this.listeners = this.listeners.filter((cb) => cb !== callback);
-    };
+  public subscribe(cb: (state: { isPlaying: boolean; isPaused: boolean; isListening: boolean }) => void) {
+    this.listeners.push(cb);
+    return () => { this.listeners = this.listeners.filter(l => l !== cb); };
   }
 
   private notify() {
     const isPlaying = !!(this.synth?.speaking && !this.synth?.paused);
-    const isPaused = !!this.synth?.paused;
-    const isListening = !!this.recognition && (this.recognition as any)._isActive;
-    this.listeners.forEach((cb) => cb({ isPlaying, isPaused, isListening }));
+    const isPaused  = !!this.synth?.paused;
+    const isListening = !!this.recognition?._isActive;
+    this.listeners.forEach(cb => cb({ isPlaying, isPaused, isListening }));
   }
 
   public getAvailableVoices(): SpeechSynthesisVoice[] {
-    if (!this.synth) return [];
-    return this.synth.getVoices();
+    return this.synth?.getVoices() ?? [];
   }
 
-  /**
-   * Cleans and condenses text for speech: maximum 1-2 punchy sentences so it remains audible and doesn't stall.
-   */
+  // Legacy method kept for backward compat
   public prepareTextForSpeech(text: string): string {
-    let clean = text
-      .replace(/[*_#`~>\[\]\(\)]/g, ' ')
-      .replace(/https?:\/\/\S+/g, '')
-      .replace(/•/g, '')
-      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '') // remove emojis
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // If text is long, take only the first 2 clear sentences to prevent Chromium TTS freeze
-    // Supports English punctuation as well as Hindi danda (।)
-    const sentences = clean.match(/[^.!?\u0964]+[.!?\u0964]+/g);
-    if (sentences && sentences.length > 2) {
-      clean = sentences.slice(0, 2).join(' ').trim();
-    } else if (clean.length > 240) {
-      clean = clean.slice(0, 235) + '...';
-    }
-
-    return clean;
+    return prepareText(text, 'en');
   }
 
   /**
-   * Speak text in selected language with natural speech parameters and automatic voice fallback
+   * Speak text in a given language. Resolves voice list asynchronously
+   * so Hindi/Tamil voices are always found even on first page load.
    */
   public speak(
     text: string,
@@ -154,186 +199,101 @@ class VoiceController {
     onError?: (err: any) => void
   ) {
     if (!this.synth) {
-      console.warn('SpeechSynthesis is not supported in this browser.');
+      console.warn('SpeechSynthesis not supported.');
       onError?.(new Error('SpeechSynthesis not supported'));
       return;
     }
 
-    // Stop and unpause any existing speech
+    // Stop any current speech
     this.stop();
-    try {
-      this.synth.resume();
-    } catch (e) {
-      // ignore
-    }
 
-    const cleanText = this.prepareTextForSpeech(text);
+    const cleanText = prepareText(text, language);
     if (!cleanText) return;
 
-    // Play audible chime to alert user and confirm speaker is active
+    // Play the chime first (works even if TTS has no voice pack)
     playNotificationChime();
 
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    const config = LANG_CONFIG[language];
-    utterance.lang = config.speechCode;
-    utterance.volume = 1.0; // Set full volume
-    utterance.pitch = 1.0;
-    utterance.rate = language === 'en' ? 1.0 : 0.92;
+    // Load voices async, then speak
+    loadVoices().then((voices) => {
+      if (!this.synth) return;
 
-    // Language-specific voice matching
-    const voices = this.getAvailableVoices();
-    let matchingVoice: SpeechSynthesisVoice | undefined;
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang   = LANG_CONFIG[language].speechCode;
+      utterance.volume = 1.0;
+      utterance.pitch  = language === 'hi' ? 1.05 : 1.0;
+      utterance.rate   = language === 'en' ? 1.0 : 0.9;
 
-    if (language === 'hi') {
-      matchingVoice = voices.find(
-        (v) =>
-          v.lang.toLowerCase().startsWith('hi') ||
-          v.lang.toLowerCase().includes('hi-in') ||
-          v.lang.toLowerCase().includes('hi_in') ||
-          v.name.toLowerCase().includes('hindi') ||
-          v.name.toLowerCase().includes('हिन्दी') ||
-          v.name.toLowerCase().includes('hemant') ||
-          v.name.toLowerCase().includes('kalpana') ||
-          v.name.toLowerCase().includes('swara') ||
-          v.name.toLowerCase().includes('madhur')
-      );
-      if (matchingVoice) {
-        utterance.voice = matchingVoice;
+      const voice = pickVoice(voices, language);
+      if (voice) {
+        utterance.voice = voice;
+        console.info(`[TTS] Using voice: "${voice.name}" (${voice.lang}) for lang=${language}`);
+      } else {
+        // No matching voice found — keep lang set so browser tries cloud TTS
+        console.warn(`[TTS] No local voice found for ${language}. Browser will attempt cloud synthesis.`);
       }
-      // CRITICAL: If no local Hindi voice is installed, DO NOT assign an English voice!
-      // Keeping utterance.lang = 'hi-IN' allows Chrome/Edge's cloud speech engine to synthesize Hindi directly.
-    } else if (language === 'ta') {
-      matchingVoice = voices.find(
-        (v) =>
-          v.lang.toLowerCase().startsWith('ta') ||
-          v.lang.toLowerCase().includes('ta-in') ||
-          v.lang.toLowerCase().includes('ta_in') ||
-          v.name.toLowerCase().includes('tamil') ||
-          v.name.toLowerCase().includes('தமிழ்') ||
-          v.name.toLowerCase().includes('valluvar')
-      );
-      if (matchingVoice) {
-        utterance.voice = matchingVoice;
-      }
-      // CRITICAL: DO NOT assign English voice to Tamil!
-    } else {
-      matchingVoice = voices.find(
-        (v) =>
-          v.lang.toLowerCase().startsWith('en') &&
-          (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('David') || v.name.includes('Jenny') || v.name.includes('Mark'))
-      ) || voices.find((v) => v.lang.toLowerCase().startsWith('en')) || voices.find((v) => v.default) || voices[0];
 
-      if (matchingVoice) {
-        utterance.voice = matchingVoice;
-      }
-    }
+      // Keep utterance in pool to prevent Chromium GC from killing it mid-speech
+      this.utterancePool.push(utterance);
+      this.currentUtterance = utterance;
 
-    // Retain utterance in global array to prevent Chromium GC freeze bug
-    if (typeof window !== 'undefined') {
-      (window as any).__speechUtterances = (window as any).__speechUtterances || [];
-      (window as any).__speechUtterances.push(utterance);
-    }
+      const cleanup = () => {
+        this.utterancePool = this.utterancePool.filter(u => u !== utterance);
+        this.currentUtterance = null;
+        this.notify();
+      };
 
-    const cleanup = () => {
-      this.currentUtterance = null;
-      if (typeof window !== 'undefined' && (window as any).__speechUtterances) {
-        const list = (window as any).__speechUtterances;
-        const idx = list.indexOf(utterance);
-        if (idx !== -1) list.splice(idx, 1);
-      }
-      this.notify();
-    };
-
-    utterance.onstart = () => {
-      this.notify();
-    };
-
-    utterance.onend = () => {
-      cleanup();
-      onEnd?.();
-    };
-
-    utterance.onerror = (e: any) => {
-      if (e.error === 'canceled' || e.error === 'interrupted') {
+      utterance.onstart  = () => this.notify();
+      utterance.onpause  = () => this.notify();
+      utterance.onresume = () => this.notify();
+      utterance.onend    = () => { cleanup(); onEnd?.(); };
+      utterance.onerror  = (e: any) => {
+        if (e.error === 'canceled' || e.error === 'interrupted') { cleanup(); return; }
+        console.warn('[TTS] utterance error:', e.error || e);
         cleanup();
-        return;
-      }
-      console.warn('Speech synthesis utterance event:', e.error || e);
-      cleanup();
+        onError?.(e);
+      };
 
-      // STRICT RULE: Never fall back to en-US for Hindi or Tamil speech!
-      // Browser will notify through normal error handler if language pack is missing.
-      onError?.(e);
-    };
-
-    utterance.onpause = () => {
-      this.notify();
-    };
-
-    utterance.onresume = () => {
-      this.notify();
-    };
-
-    this.currentUtterance = utterance;
-
-    // Small delay to ensure any previous cancel finished
-    setTimeout(() => {
-      if (this.synth) {
+      // Delay to ensure cancel() from stop() has cleared the queue
+      setTimeout(() => {
+        if (!this.synth) return;
         try {
-          this.synth.resume();
+          this.synth.resume(); // Unblock if previously paused
           this.synth.speak(utterance);
           this.notify();
         } catch (err) {
-          console.warn('Error calling synth.speak:', err);
+          console.warn('[TTS] speak() error:', err);
         }
-      }
-    }, 40);
+      }, 80);
+    });
   }
 
   /**
-   * Direct Sound & Voice Speaker Test
+   * Test speaker for a language — plays chime + short spoken phrase
    */
   public testSpeaker(language: VoiceLanguage = 'en'): { spokenText: string; voiceFound: boolean } {
-    playNotificationChime();
-
     const voices = this.getAvailableVoices();
-    let sampleText = '';
-    let hasVoice = false;
+    const voice  = pickVoice(voices, language);
 
-    if (language === 'hi') {
-      hasVoice = voices.some(
-        (v) =>
-          v.lang.toLowerCase().includes('hi') ||
-          v.name.toLowerCase().includes('hindi') ||
-          v.name.toLowerCase().includes('हिन्दी')
-      );
-      sampleText = 'नमस्ते! ContractGuard आवाज सहायता बिल्कुल सही और स्पष्ट रूप से काम कर रही है।';
-    } else if (language === 'ta') {
-      hasVoice = voices.some(
-        (v) =>
-          v.lang.toLowerCase().includes('ta') ||
-          v.name.toLowerCase().includes('tamil') ||
-          v.name.toLowerCase().includes('தமிழ்')
-      );
-      sampleText = 'வணக்கம்! ContractGuard குரல் உதவி தெளிவாகவும் சத்தமாகவும் வேலை செய்கிறது.';
-    } else {
-      hasVoice = voices.some((v) => v.lang.toLowerCase().startsWith('en'));
-      sampleText = 'Hello! ContractGuard voice assistant is working loud and clear!';
-    }
+    const samples: Record<VoiceLanguage, string> = {
+      en: 'Hello! ContractGuard voice assistant is working loud and clear!',
+      ta: 'வணக்கம்! ContractGuard குரல் உதவி தெளிவாக வேலை செய்கிறது.',
+      hi: 'नमस्ते! ContractGuard आवाज़ सहायता बिल्कुल सही काम कर रही है।',
+    };
 
+    const sampleText = samples[language];
     this.speak(sampleText, language);
-    return { spokenText: sampleText, voiceFound: hasVoice };
+    return { spokenText: sampleText, voiceFound: !!voice };
   }
 
   public pause() {
-    if (this.synth && this.synth.speaking && !this.synth.paused) {
+    if (this.synth?.speaking && !this.synth.paused) {
       this.synth.pause();
       this.notify();
     }
   }
 
   public resume() {
-    if (this.synth && this.synth.paused) {
+    if (this.synth?.paused) {
       this.synth.resume();
       this.notify();
     }
@@ -341,21 +301,15 @@ class VoiceController {
 
   public stop() {
     if (this.synth) {
-      try {
-        this.synth.cancel();
-      } catch (e) {
-        // ignore
-      }
+      try { this.synth.cancel(); } catch (e) { /* ignore */ }
       this.currentUtterance = null;
-      if (typeof window !== 'undefined' && (window as any).__speechUtterances) {
-        (window as any).__speechUtterances = [];
-      }
+      this.utterancePool = [];
       this.notify();
     }
   }
 
   /**
-   * Start microphone Speech Recognition
+   * Start microphone speech recognition
    */
   public startListening(
     language: VoiceLanguage,
@@ -364,73 +318,50 @@ class VoiceController {
     onEnd?: () => void
   ) {
     if (!isSpeechRecognitionSupported()) {
-      onError?.(new Error('SpeechRecognition is not supported in this browser. Please use Chrome or Edge.'));
+      onError?.(new Error('SpeechRecognition not supported. Use Chrome or Edge.'));
       return;
     }
 
-    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    this.recognition = new SpeechRecognitionClass();
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    this.recognition = new SR();
+    this.recognition.lang             = LANG_CONFIG[language].speechCode;
+    this.recognition.continuous       = false;
+    this.recognition.interimResults   = true;
+    this.recognition.maxAlternatives  = 1;
+    this.recognition._isActive        = true;
 
-    this.recognition.lang = LANG_CONFIG[language].speechCode;
-    this.recognition.continuous = false;
-    this.recognition.interimResults = true;
-    this.recognition.maxAlternatives = 1;
-
-    (this.recognition as any)._isActive = true;
-
-    this.recognition.onstart = () => {
-      this.notify();
-    };
+    this.recognition.onstart = () => this.notify();
 
     this.recognition.onresult = (event: any) => {
-      let interimTranscript = '';
-      let finalTranscript = '';
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          finalTranscript += event.results[i][0].transcript;
-        } else {
-          interimTranscript += event.results[i][0].transcript;
-        }
+      let interim = '', final = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) final   += event.results[i][0].transcript;
+        else                          interim += event.results[i][0].transcript;
       }
-
-      if (finalTranscript) {
-        onResult(finalTranscript, true);
-      } else if (interimTranscript) {
-        onResult(interimTranscript, false);
-      }
+      if (final)   onResult(final,   true);
+      else if (interim) onResult(interim, false);
     };
 
     this.recognition.onerror = (event: any) => {
-      console.warn('Speech recognition error:', event.error);
-      (this.recognition as any)._isActive = false;
+      console.warn('[STT] error:', event.error);
+      this.recognition._isActive = false;
       this.notify();
       onError?.(event);
     };
 
     this.recognition.onend = () => {
-      if (this.recognition) {
-        (this.recognition as any)._isActive = false;
-      }
+      if (this.recognition) this.recognition._isActive = false;
       this.notify();
       onEnd?.();
     };
 
-    try {
-      this.recognition.start();
-    } catch (e) {
-      onError?.(e);
-    }
+    try { this.recognition.start(); } catch (e) { onError?.(e); }
   }
 
   public stopListening() {
     if (this.recognition) {
-      try {
-        this.recognition.stop();
-      } catch (e) {
-        // ignore
-      }
-      (this.recognition as any)._isActive = false;
+      try { this.recognition.stop(); } catch (e) { /* ignore */ }
+      this.recognition._isActive = false;
       this.notify();
     }
   }
